@@ -261,33 +261,82 @@ H.screenshot = function(msg, reply)
   return { path = system.pathForFile(name, system.TemporaryDirectory), info = screenInfo() }
 end
 
+-- Every finger currently down (held fingers, taps and drags in progress): id -> label.
+-- Without system.activate("multitouch") Solar2D only follows one touch at a time, so a
+-- second finger is refused, as a real device would ignore it.
+local multitouch = false
+do
+  local oa, od = system.activate, system.deactivate
+  system.activate = function(what, ...)
+    if what == "multitouch" then multitouch = true end
+    return oa(what, ...)
+  end
+  system.deactivate = function(what, ...)
+    if what == "multitouch" then multitouch = false end
+    return od(what, ...)
+  end
+end
+local active = {}
+local function fingersDown()
+  local n, labels = 0, {}
+  for _, l in pairs(active) do n = n + 1; labels[#labels + 1] = l end
+  table.sort(labels)
+  return n, labels
+end
+local function checkAnotherFinger()
+  local n, labels = fingersDown()
+  if n > 0 and not multitouch then
+    error("another finger is already down (" .. table.concat(labels, ", ") .. ") and the app hasn't called " ..
+          "system.activate(\"multitouch\"), so a real device would ignore this touch. Lift it with touch_up first.", 0)
+  end
+end
+
+-- a touch that ends close to where it began also produces a "tap" event
+local function tapSlop() return 10 * display.actualContentWidth / math.max(display.pixelWidth, 1) end
+local function sendTapIfStill(x, y, x0, y0)
+  local slop = tapSlop()
+  if math.abs(x - x0) <= slop and math.abs(y - y0) <= slop then
+    return deliver({ name = "tap", numTaps = 1, x = x, y = y, time = system.getTimer() }, x, y)
+  end
+end
+
 H.tap = function(msg, reply)
+  checkAnotherFinger()
   local x, y = toContent(msg.x, msg.y, msg.unit)
   local id = newTouchId()
   local r = { x = r1(x), y = r1(y) }
-  r.began = deliver(touchEvent("began", id, x, y, x, y), x, y)
+  active[id] = "tap"
+  local ok, res = pcall(deliver, touchEvent("began", id, x, y, x, y), x, y)
+  if not ok then active[id] = nil; focus[id] = nil; error(res, 0) end
+  r.began = res
   -- hold like a real finger (widgets tell a tap from a press by timing)
   timer.performWithDelay(math.max(tonumber(msg.hold_ms) or 100, 1), function()
-    local ok, err = pcall(function()
+    local ok2, err = pcall(function()
+      active[id] = nil
       r.ended = deliver(touchEvent("ended", id, x, y, x, y), x, y)
       focus[id] = nil
-      r.tap = deliver({ name = "tap", numTaps = 1, x = x, y = y, time = system.getTimer() }, x, y)
+      r.tap = sendTapIfStill(x, y, x, y)
     end)
-    if ok then reply(true, r) else reply(false, err) end
+    active[id] = nil; focus[id] = nil
+    if ok2 then reply(true, r) else reply(false, err) end
   end)
   return ASYNC
 end
 
 H.drag = function(msg, reply)
+  checkAnotherFinger()
   local x0, y0 = toContent(msg.x1, msg.y1, msg.unit)
   local x1, y1 = toContent(msg.x2, msg.y2, msg.unit)
   local dur = math.max(tonumber(msg.duration_ms) or 300, 1)
   local id = newTouchId()
   local r = { from = { r1(x0), r1(y0) }, to = { r1(x1), r1(y1) } }
-  r.began = deliver(touchEvent("began", id, x0, y0, x0, y0), x0, y0)
+  active[id] = "drag"
+  local ok, res = pcall(deliver, touchEvent("began", id, x0, y0, x0, y0), x0, y0)
+  if not ok then active[id] = nil; focus[id] = nil; error(res, 0) end
+  r.began = res
   local t0 = system.getTimer()
   local function step()
-    local ok, err = pcall(function()
+    local ok2, err = pcall(function()
       local f = math.min((system.getTimer() - t0) / dur, 1)
       local x, y = x0 + (x1 - x0) * f, y0 + (y1 - y0) * f
       if f < 1 then
@@ -295,15 +344,121 @@ H.drag = function(msg, reply)
       else
         Runtime:removeEventListener("enterFrame", step)
         deliver(touchEvent("moved", id, x1, y1, x0, y0), x1, y1)
+        active[id] = nil
         r.ended = deliver(touchEvent("ended", id, x1, y1, x0, y0), x1, y1)
         focus[id] = nil
         reply(true, r)
+      end
+    end)
+    if not ok2 then
+      Runtime:removeEventListener("enterFrame", step)
+      active[id] = nil; focus[id] = nil
+      reply(false, err)
+    end
+  end
+  Runtime:addEventListener("enterFrame", step)
+  return ASYNC
+end
+
+-- Fingers that stay down between calls: touch_down / touch_move / touch_up.
+local fingers = {}
+
+local function fingerName(msg) return tostring(msg.finger or "1") end
+local function getFinger(f)
+  local t = fingers[f]
+  if not t then
+    local names = {}
+    for k in pairs(fingers) do names[#names + 1] = k end
+    table.sort(names)
+    error("finger " .. f .. " is not down" .. (#names > 0 and (" (down: " .. table.concat(names, ", ") .. ")") or "") ..
+          "; use touch_down first", 0)
+  end
+  return t
+end
+
+H.touch_down = function(msg)
+  local f = fingerName(msg)
+  if fingers[f] then
+    error("finger " .. f .. " is already down at " .. r1(fingers[f].x) .. "," .. r1(fingers[f].y) ..
+          " (touch_up it first, or use another finger name)", 0)
+  end
+  checkAnotherFinger()
+  local x, y = toContent(msg.x, msg.y, msg.unit)
+  local t = { id = newTouchId(), x = x, y = y, x0 = x, y0 = y, t0 = system.getTimer() }
+  fingers[f], active[t.id] = t, "finger " .. f
+  local ok, res = pcall(deliver, touchEvent("began", t.id, x, y, x, y), x, y)
+  if not ok then fingers[f], active[t.id], focus[t.id] = nil, nil, nil; error(res, 0) end
+  return { finger = f, x = r1(x), y = r1(y), handled_by = res, fingers_down = (fingersDown()) }
+end
+
+H.touch_move = function(msg, reply)
+  local f = fingerName(msg)
+  local t = getFinger(f)
+  local tx, ty = toContent(msg.x, msg.y, msg.unit)
+  local dur = tonumber(msg.duration_ms) or 0
+  if dur <= 0 then
+    t.x, t.y = tx, ty
+    return { finger = f, x = r1(tx), y = r1(ty), handled_by = deliver(touchEvent("moved", t.id, tx, ty, t.x0, t.y0), tx, ty) }
+  end
+  local xs, ys, t0 = t.x, t.y, system.getTimer()
+  local function step()
+    local ok, err = pcall(function()
+      if fingers[f] ~= t then
+        Runtime:removeEventListener("enterFrame", step)
+        reply(false, "finger " .. f .. " was lifted during the move")
+        return
+      end
+      local k = math.min((system.getTimer() - t0) / dur, 1)
+      local x, y = xs + (tx - xs) * k, ys + (ty - ys) * k
+      t.x, t.y = x, y
+      local r = deliver(touchEvent("moved", t.id, x, y, t.x0, t.y0), x, y)
+      if k >= 1 then
+        Runtime:removeEventListener("enterFrame", step)
+        reply(true, { finger = f, x = r1(x), y = r1(y), handled_by = r })
       end
     end)
     if not ok then Runtime:removeEventListener("enterFrame", step); reply(false, err) end
   end
   Runtime:addEventListener("enterFrame", step)
   return ASYNC
+end
+
+local function liftFinger(f, msg)
+  local t = getFinger(f)
+  local x, y = t.x, t.y
+  if msg.x ~= nil and msg.y ~= nil then
+    x, y = toContent(msg.x, msg.y, msg.unit)
+    if x ~= t.x or y ~= t.y then
+      t.x, t.y = x, y
+      deliver(touchEvent("moved", t.id, x, y, t.x0, t.y0), x, y)
+    end
+  end
+  fingers[f], active[t.id] = nil, nil
+  local phase = msg.cancel and "cancelled" or "ended"
+  local ok, res = pcall(deliver, touchEvent(phase, t.id, x, y, t.x0, t.y0), x, y)
+  focus[t.id] = nil
+  if not ok then error(res, 0) end
+  local r = { finger = f, phase = phase, x = r1(x), y = r1(y), held_ms = math.floor(system.getTimer() - t.t0), handled_by = res }
+  if not msg.cancel then r.tap = sendTapIfStill(x, y, t.x0, t.y0) end
+  return r
+end
+
+H.touch_up = function(msg)
+  local f = fingerName(msg)
+  if f ~= "all" then return liftFinger(f, msg) end
+  local names, out = {}, {}
+  for k in pairs(fingers) do names[#names + 1] = k end
+  table.sort(names)
+  for _, k in ipairs(names) do out[#out + 1] = liftFinger(k, { cancel = msg.cancel }) end
+  return { lifted = out }
+end
+
+H.fingers = function()
+  local out = {}
+  for k, t in pairs(fingers) do
+    out[#out + 1] = { finger = k, x = r1(t.x), y = r1(t.y), held_ms = math.floor(system.getTimer() - t.t0) }
+  end
+  return { fingers = out, multitouch = multitouch }
 end
 
 H.key = function(msg, reply)

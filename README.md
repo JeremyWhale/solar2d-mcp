@@ -19,6 +19,7 @@ during development).
 | `screenshot` | PNG of the screen right now (downscaled, default 1024 px longest side) |
 | `tap` | Touch began/ended + tap at a point, delivered to the topmost objects there (`hold_ms` for long presses) |
 | `drag` | Touch began → moved every frame → ended (swipes, sliders, scroll views, picker wheels) |
+| `touch_down` / `touch_move` / `touch_up` | Fingers that stay down between calls: press and hold while taking screenshots or doing other things, slide off a button, hold a game control, multi-touch with named fingers (`finger: "all"` lifts every finger) |
 | `key` | Key down/up to Runtime `key` listeners |
 | `type_text` | Type into a native text field/box: the `userInput` events a keyboard sends (began, editing per character, submitted) |
 | `answer_alert` | Read or answer a `native.showAlert` (shown as an in-app overlay; its buttons can also be tapped) |
@@ -48,6 +49,9 @@ Coordinates for `tap`/`drag` default to **pixels in the last screenshot**;
   the focus object and up through its parent groups); scroll view / container clipping
   is respected. Tested with every `widget` library widget (button, switch, slider,
   segmented control, stepper, scroll view, table view, picker wheel, tab bar).
+- Multi-touch follows the app: until it calls `system.activate("multitouch")`, a second
+  finger (held, tap or drag) is refused with an explanation, as a real device would
+  ignore it. A touch released close to where it began also sends a `tap` event.
 - `native.showAlert` is replaced (simulator only, while the bridge is in) by an in-app
   overlay, so the agent can see it in screenshots and press its buttons; the app's
   listener gets the normal `completion` event. `native.cancelAlert` works too.

@@ -28,6 +28,7 @@ run_project adds one line at the very start of main.lua and writes solar2d_mcp_b
 next to it (both only act in the simulator; remove_bridge takes them out). \
 Tap/drag coordinates default to pixels in the last screenshot; display_tree gives \
 object bounds in content units (use unit \"content\" for those). \
+touch_down/touch_move/touch_up hold fingers down across calls (press and hold, multi-touch). \
 type_text types into native text fields; native.showAlert appears as an in-app overlay \
 (tap its buttons or use answer_alert). After an action that animates or changes scene, \
 use wait_for before the next screenshot. eval_lua can read or change any variable.";
@@ -103,6 +104,41 @@ struct DragParams {
     duration_ms: Option<u64>,
     #[schemars(description = "screenshot (default) | content | percent")]
     unit: Option<Unit>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct TouchDownParams {
+    x: f64,
+    y: f64,
+    #[schemars(description = "screenshot (default) | content | percent")]
+    unit: Option<Unit>,
+    #[schemars(description = "Name for this finger, default \"1\". Use different names to hold several at once (the app must have called system.activate(\"multitouch\"))")]
+    finger: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct TouchMoveParams {
+    x: f64,
+    y: f64,
+    #[schemars(description = "screenshot (default) | content | percent")]
+    unit: Option<Unit>,
+    #[schemars(description = "Default \"1\"")]
+    finger: Option<String>,
+    #[schemars(description = "Glide there over this many ms (a moved event every frame). Default 0: jump in one moved event")]
+    duration_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct TouchUpParams {
+    #[schemars(description = "Default \"1\"; \"all\" lifts every finger")]
+    finger: Option<String>,
+    #[schemars(description = "Optional point to lift at (sends a moved event there first)")]
+    x: Option<f64>,
+    y: Option<f64>,
+    #[schemars(description = "screenshot (default) | content | percent")]
+    unit: Option<Unit>,
+    #[schemars(description = "Send phase \"cancelled\" instead of \"ended\" (like the OS taking the touch away)")]
+    cancel: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -319,9 +355,16 @@ impl Solar2dMcp {
         }
     }
 
-    #[tool(description = "Whether the simulator is running, which project, whether the bridge is connected, and the screen/content size.")]
+    #[tool(description = "Whether the simulator is running, which project, whether the bridge is connected, the screen/content size, and any fingers held down.")]
     async fn status(&self) -> Result<CallToolResult, McpError> {
-        ok_text(pretty(&self.status_json().await))
+        let mut st = self.status_json().await;
+        if self.state.bridge_connected() {
+            if let Ok(f) = self.state.request(json!({"cmd": "fingers"}), Duration::from_secs(3)).await {
+                st["fingers_down"] = f.get("fingers").cloned().unwrap_or(Value::Null);
+                st["app_multitouch"] = f.get("multitouch").cloned().unwrap_or(Value::Null);
+            }
+        }
+        ok_text(pretty(&st))
     }
 
     #[tool(description = "Read the app's console output (print(), warnings, runtime errors with stack traces). Pass since=next_cursor to get only new lines.")]
@@ -425,6 +468,53 @@ impl Solar2dMcp {
         let dur = p.duration_ms.unwrap_or(300).min(60_000);
         let cmd = json!({"cmd": "drag", "x1": x1, "y1": y1, "x2": x2, "y2": y2, "unit": unit, "duration_ms": dur});
         match self.state.request(cmd, Duration::from_millis(dur + 10_000)).await {
+            Ok(r) => ok_text(pretty(&r)),
+            Err(e) => err_text(e),
+        }
+    }
+
+    #[tool(description = "Put a finger down and keep it there (touch phase \"began\"). It stays down while you take screenshots, wait, or use other tools, until touch_up. Use for press-and-hold, holding a game button while doing something else, or multi-touch.")]
+    async fn touch_down(&self, Parameters(p): Parameters<TouchDownParams>) -> Result<CallToolResult, McpError> {
+        let (x, y, unit) = match self.to_bridge_coords(p.x, p.y, p.unit) {
+            Ok(v) => v,
+            Err(e) => return err_text(e),
+        };
+        let cmd = json!({"cmd": "touch_down", "x": x, "y": y, "unit": unit, "finger": p.finger.unwrap_or_else(|| "1".into())});
+        match self.state.request(cmd, Duration::from_secs(10)).await {
+            Ok(r) => ok_text(pretty(&r)),
+            Err(e) => err_text(e),
+        }
+    }
+
+    #[tool(description = "Move a finger that is down (touch phase \"moved\"), instantly or gliding over duration_ms. It stays down afterwards.")]
+    async fn touch_move(&self, Parameters(p): Parameters<TouchMoveParams>) -> Result<CallToolResult, McpError> {
+        let (x, y, unit) = match self.to_bridge_coords(p.x, p.y, p.unit) {
+            Ok(v) => v,
+            Err(e) => return err_text(e),
+        };
+        let dur = p.duration_ms.unwrap_or(0).min(60_000);
+        let cmd = json!({"cmd": "touch_move", "x": x, "y": y, "unit": unit, "duration_ms": dur,
+                         "finger": p.finger.unwrap_or_else(|| "1".into())});
+        match self.state.request(cmd, Duration::from_millis(dur + 10_000)).await {
+            Ok(r) => ok_text(pretty(&r)),
+            Err(e) => err_text(e),
+        }
+    }
+
+    #[tool(description = "Lift a finger that is down (touch phase \"ended\", or \"cancelled\"); also sends a tap event if it hadn't moved. finger \"all\" lifts every finger.")]
+    async fn touch_up(&self, Parameters(p): Parameters<TouchUpParams>) -> Result<CallToolResult, McpError> {
+        let mut cmd = json!({"cmd": "touch_up", "finger": p.finger.unwrap_or_else(|| "1".into()), "cancel": p.cancel.unwrap_or(false)});
+        if let (Some(x), Some(y)) = (p.x, p.y) {
+            match self.to_bridge_coords(x, y, p.unit) {
+                Ok((x, y, unit)) => {
+                    cmd["x"] = json!(x);
+                    cmd["y"] = json!(y);
+                    cmd["unit"] = json!(unit);
+                }
+                Err(e) => return err_text(e),
+            }
+        }
+        match self.state.request(cmd, Duration::from_secs(10)).await {
             Ok(r) => ok_text(pretty(&r)),
             Err(e) => err_text(e),
         }
