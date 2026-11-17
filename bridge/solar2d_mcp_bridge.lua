@@ -98,7 +98,11 @@ local function labelOf(o)
 end
 
 local function kindOf(o)
+  local w = rawget(o, "_widgetType")
+  if type(w) == "string" then return "widget:" .. w end
   if o.numChildren ~= nil then return "group" end
+  if o.isSecure ~= nil then return "textfield" end
+  if o.isEditable ~= nil then return "textbox" end
   if o.text ~= nil then return "text" end
   return "object"
 end
@@ -120,33 +124,49 @@ end
 ----------------------------------------------------------------------------
 -- hit testing + synthetic input
 ----------------------------------------------------------------------------
+local function inBounds(b, x, y)
+  return b and x >= b.xMin and x <= b.xMax and y >= b.yMin and y <= b.yMax
+end
+
 -- Topmost-first list of objects under the point, groups after the children that were hit
--- (the order Solar2D propagates touch/tap events in).
+-- (the order Solar2D propagates touch/tap events in). A group's contentBounds is the union
+-- of its children, except for containers (scroll views, table views...), where it is the
+-- clip rectangle, so requiring the point to be inside each group also respects clipping.
 local function hitList(group, x, y, out)
   for i = group.numChildren, 1, -1 do
     local o = group[i]
     if o and shown(o) then
       if o.numChildren ~= nil then
-        local before = #out
-        hitList(o, x, y, out)
-        if #out > before then out[#out + 1] = o end
-      else
-        local b = o.contentBounds
-        if b and x >= b.xMin and x <= b.xMax and y >= b.yMin and y <= b.yMax then out[#out + 1] = o end
+        if inBounds(o.contentBounds, x, y) then
+          local before = #out
+          hitList(o, x, y, out)
+          if #out > before then out[#out + 1] = o end
+        end
+      elseif inBounds(o.contentBounds, x, y) then
+        out[#out + 1] = o
       end
     end
   end
   return out
 end
 
+-- Mirror the stage's touch focus so synthetic touches follow it like real ones:
+--   setFocus(nil) clears all; setFocus(obj, nil) removes obj's focus;
+--   setFocus(obj, id) focuses one touch; setFocus(obj) focuses every touch.
 local stage = display.getCurrentStage()
 local focus = {}
 do
   local origSetFocus = stage.setFocus
-  stage.setFocus = function(self, obj, id)
-    focus[id or "all"] = obj
-    if obj == nil then focus = {} end
-    return origSetFocus(self, obj, id)
+  stage.setFocus = function(self, obj, ...)
+    local n, id = select("#", ...), ...
+    if obj == nil then
+      focus = {}
+    elseif n >= 1 and id == nil then
+      for k, v in pairs(focus) do if v == obj then focus[k] = nil end end
+    else
+      focus[id or "all"] = obj
+    end
+    return origSetFocus(self, obj, ...)
   end
 end
 
@@ -157,16 +177,20 @@ local function dispatch(o, ev)
   if ok then return res end
   local what = (labelOf(o) or (o == Runtime and "Runtime") or kindOf(o)) .. " " .. ev.name .. " listener"
   local msg = tostring(res)
-  rawPrint("[solar2d-mcp] Runtime error in " .. what .. ": " .. msg)
-  if client and forwardPrint then send({ type = "error", message = what .. ": " .. msg, stack = "" }) end
+  print("[solar2d-mcp] Runtime error in " .. what .. ": " .. msg)
   error("the app's " .. what .. " threw: " .. msg:match("^[^\n]*"), 0)
 end
 
 local function deliver(ev, x, y)
-  local fo = focus[ev.id] or focus.all
+  local fo = ev.name == "touch" and (focus[ev.id] or focus.all)
   if fo and fo.parent then
-    ev.target = fo
-    dispatch(fo, ev)
+    -- a focused touch goes to the focus object, then up through its parent groups
+    local o = fo
+    while o and o ~= stage do
+      ev.target = o
+      if dispatch(o, ev) then return { brief(o) } end
+      o = o.parent
+    end
     return { brief(fo) }
   end
   local handledBy = nil
@@ -199,7 +223,7 @@ local function dump(v, depth, seen)
   if t ~= "table" then return tostring(v) end
   if seen[v] then return "<cycle>" end
   if v == Runtime then return "<Runtime>" end
-  if v._proxy ~= nil or v.contentBounds ~= nil then
+  if type(rawget(v, "_proxy")) == "userdata" then
     local b = brief(v)
     return string.format("<%s%s>", b.kind, b.name and (" " .. b.name) or "")
   end
@@ -242,8 +266,8 @@ H.tap = function(msg, reply)
   local id = newTouchId()
   local r = { x = r1(x), y = r1(y) }
   r.began = deliver(touchEvent("began", id, x, y, x, y), x, y)
-  -- end the touch on the next frame, like a real quick tap
-  timer.performWithDelay(1, function()
+  -- hold like a real finger (widgets tell a tap from a press by timing)
+  timer.performWithDelay(math.max(tonumber(msg.hold_ms) or 100, 1), function()
     local ok, err = pcall(function()
       r.ended = deliver(touchEvent("ended", id, x, y, x, y), x, y)
       focus[id] = nil
@@ -303,7 +327,15 @@ H.tree = function(msg)
   local maxNodes = tonumber(msg.max_nodes) or 400
   local hidden = msg.include_hidden and true or false
   local count, truncated = 0, false
-  local function node(o, depth)
+  local function clipTo(c, b)
+    if not b then return c end
+    return { xMin = math.max(c.xMin, b.xMin), yMin = math.max(c.yMin, b.yMin),
+             xMax = math.min(c.xMax, b.xMax), yMax = math.min(c.yMax, b.yMax) }
+  end
+  local screen = { xMin = display.screenOriginX, yMin = display.screenOriginY,
+                   xMax = display.screenOriginX + display.actualContentWidth,
+                   yMax = display.screenOriginY + display.actualContentHeight }
+  local function node(o, depth, clip)
     count = count + 1
     local b = o.contentBounds
     local d = {
@@ -311,6 +343,11 @@ H.tree = function(msg)
       x = r1(o.x), y = r1(o.y),
       bounds = b and { r1(b.xMin), r1(b.yMin), r1(b.xMax), r1(b.yMax) } or nil,
     }
+    -- not visible: scrolled out of its scroll view/container, or off screen
+    if b and (b.xMax <= clip.xMin or b.xMin >= clip.xMax or b.yMax <= clip.yMin or b.yMin >= clip.yMax) then
+      d.offscreen = true
+    end
+    if o.numChildren ~= nil then clip = clipTo(clip, b) end
     if o.isVisible == false then d.visible = false end
     if (o.alpha or 1) < 1 then d.alpha = r1(o.alpha) end
     local l = listenerNames(o)
@@ -323,13 +360,13 @@ H.tree = function(msg)
         for i = 1, o.numChildren do
           local c = o[i]
           if count >= maxNodes then truncated = true; break end
-          if c and (hidden or shown(c)) then d.children[#d.children + 1] = node(c, depth + 1) end
+          if c and (hidden or shown(c)) then d.children[#d.children + 1] = node(c, depth + 1, clip) end
         end
       end
     end
     return d
   end
-  local root = node(stage, 0)
+  local root = node(stage, 0, screen)
   local out = { stage = root, truncated = truncated, nodes = count, info = screenInfo(),
                 runtime_listeners = listenerNames(Runtime) }
   local composer = package.loaded["composer"]
@@ -357,6 +394,243 @@ end
 H.quit = function(msg, reply)
   reply(true, { quitting = true })
   timer.performWithDelay(50, function() native.requestExit() end)
+  return ASYNC
+end
+
+----------------------------------------------------------------------------
+-- finding objects
+----------------------------------------------------------------------------
+local function walk(fn)
+  local function rec(g)
+    for i = 1, g.numChildren do
+      local o = g[i]
+      if o then
+        if fn(o) then return o end
+        if o.numChildren ~= nil then
+          local f = rec(o)
+          if f then return f end
+        end
+      end
+    end
+  end
+  return rec(stage)
+end
+
+local function isField(o) return o.isSecure ~= nil or o.isEditable ~= nil end
+
+----------------------------------------------------------------------------
+-- typing into native text fields
+----------------------------------------------------------------------------
+local keyboardFocus = nil
+do
+  local orig = native.setKeyboardFocus
+  native.setKeyboardFocus = function(o, ...)
+    keyboardFocus = o
+    return orig(o, ...)
+  end
+end
+
+local function keyNameFor(ch)
+  if ch == " " then return "space" end
+  if ch == "\n" then return "enter" end
+  if ch == "\t" then return "tab" end
+  return ch:lower()
+end
+
+H.type = function(msg)
+  local text = tostring(msg.text or "")
+  local target
+  if msg.target then
+    target = walk(function(o) return labelOf(o) == tostring(msg.target) end)
+    if not target then error("no object named " .. tostring(msg.target), 0) end
+    if not isField(target) then error(tostring(msg.target) .. " is not a native text field or text box", 0) end
+  elseif msg.x then
+    local x, y = toContent(msg.x, msg.y, msg.unit)
+    for _, o in ipairs(hitList(stage, x, y, {})) do
+      if isField(o) then target = o; break end
+    end
+    if not target then error("no native text field at that point", 0) end
+  elseif keyboardFocus and keyboardFocus.parent and isField(keyboardFocus) then
+    target = keyboardFocus
+  else
+    local fields = {}
+    walk(function(o) if isField(o) and shown(o) then fields[#fields + 1] = o end end)
+    if #fields == 1 then
+      target = fields[1]
+    elseif #fields > 1 then
+      local names = {}
+      for i, f in ipairs(fields) do names[i] = labelOf(f) or ("unnamed at " .. r1(f.x) .. "," .. r1(f.y)) end
+      error("there are " .. #fields .. " text fields (" .. table.concat(names, ", ") .. "): pass target (its name) or x/y", 0)
+    end
+  end
+
+  if not target then
+    -- no text field anywhere: type as key presses (for apps that read the keyboard)
+    for ch in text:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+      local base = { name = "key", keyName = keyNameFor(ch), nativeKeyCode = 0,
+                     isShiftDown = ch:match("%u") ~= nil, isCtrlDown = false, isAltDown = false, isCommandDown = false }
+      base.phase = "down"; dispatch(Runtime, base)
+      local up = {}; for k, v in pairs(base) do up[k] = v end
+      up.phase = "up"; dispatch(Runtime, up)
+    end
+    return { mode = "key events (no text field found)", typed = text }
+  end
+  if target.isEditable == false then error("that text box is not editable", 0) end
+
+  -- the same userInput events the keyboard would produce
+  local function ev(t)
+    t.name = "userInput"; t.target = target
+    dispatch(target, t)
+  end
+  ev({ phase = "began" })
+  local cur = target.text or ""
+  if msg.replace ~= false and cur ~= "" then
+    local old = cur
+    target.text = ""; cur = ""
+    ev({ phase = "editing", text = "", oldText = old, newCharacters = "", startPosition = 0, numDeleted = #old })
+  end
+  for ch in text:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+    local old = cur
+    cur = cur .. ch
+    target.text = cur
+    ev({ phase = "editing", text = cur, oldText = old, newCharacters = ch, startPosition = #old, numDeleted = 0 })
+  end
+  if msg.submit ~= false then ev({ phase = "submitted" }) end
+  return { field = brief(target), text = target.text, submitted = msg.submit ~= false }
+end
+
+----------------------------------------------------------------------------
+-- native.showAlert -> an in-app overlay the agent can see and tap
+----------------------------------------------------------------------------
+local alerts = {}
+
+local function closeAlert(a, event)
+  for i, x in ipairs(alerts) do if x == a then table.remove(alerts, i); break end end
+  if a.group and a.group.removeSelf then a.group:removeSelf() end
+  a.group = nil
+  if alerts[1] and not alerts[1].group then alerts[1].show() end
+  if type(a.listener) == "function" or type(a.listener) == "table" then
+    event.name = "completion"
+    local ok, err = xpcall(function()
+      if type(a.listener) == "function" then a.listener(event) else a.listener:completion(event) end
+    end, debug.traceback)
+    if not ok then print("[solar2d-mcp] Runtime error in alert listener: " .. tostring(err)) end
+  end
+end
+
+local function answerAlert(a, index)
+  print(string.format("[solar2d-mcp] alert \"%s\": pressed %d (%s)", a.title, index, tostring(a.buttons[index])))
+  closeAlert(a, { action = "clicked", index = index })
+end
+
+local function buildAlert(a)
+  local W, Hh = display.actualContentWidth, display.actualContentHeight
+  local ox, oy = display.screenOriginX, display.screenOriginY
+  local fs = math.max(W * 0.042, 8)
+  local pad = fs
+  local pw = W * 0.8
+  local g = display.newGroup()
+  g.name = "solar2d-mcp alert"
+  local shade = display.newRect(g, ox + W / 2, oy + Hh / 2, W, Hh)
+  shade:setFillColor(0, 0, 0, 0.45)
+  shade:addEventListener("touch", function() return true end)
+  shade:addEventListener("tap", function() return true end)
+  local panel = display.newRoundedRect(g, ox + W / 2, 0, pw, 10, fs * 0.6)
+  panel:setFillColor(0.97, 0.97, 0.98)
+  panel:setStrokeColor(0.6); panel.strokeWidth = 2
+  local title = display.newText({ parent = g, text = a.title, width = pw - 2 * pad, fontSize = fs * 1.15,
+                                  font = native.systemFontBold, align = "center" })
+  title:setFillColor(0.1); title.name = "alert title"
+  local body = display.newText({ parent = g, text = a.message, width = pw - 2 * pad, fontSize = fs, align = "center" })
+  body:setFillColor(0.2); body.name = "alert message"
+  local bh = fs * 2.4
+  local h = pad + title.height + pad * 0.6 + body.height + pad + #a.buttons * (bh + pad * 0.5) + pad * 0.5
+  local top = oy + (Hh - h) / 2
+  panel.y = top + h / 2; panel.height = h
+  title.x, title.y = panel.x, top + pad + title.height / 2
+  body.x, body.y = panel.x, title.y + title.height / 2 + pad * 0.6 + body.height / 2
+  local y = body.y + body.height / 2 + pad + bh / 2
+  for i, label in ipairs(a.buttons) do
+    local b = display.newRoundedRect(g, panel.x, y, pw - 2 * pad, bh, fs * 0.4)
+    b:setFillColor(0.2, 0.45, 0.9)
+    b.name = "alert button " .. i .. ": " .. tostring(label)
+    local t = display.newText({ parent = g, text = tostring(label), x = b.x, y = b.y, fontSize = fs })
+    t:setFillColor(1)
+    b:addEventListener("touch", function(e)
+      if e.phase == "ended" then answerAlert(a, i) end
+      return true
+    end)
+    y = y + bh + pad * 0.5
+  end
+  a.group = g
+end
+
+do
+  local origShow, origCancel = native.showAlert, native.cancelAlert
+  native.showAlert = function(title, message, buttons, listener)
+    if type(buttons) == "function" then buttons, listener = nil, buttons end
+    if type(buttons) ~= "table" or #buttons == 0 then buttons = { "OK" } end
+    local a = { title = tostring(title or ""), message = tostring(message or ""), buttons = buttons,
+                listener = listener, isSolar2dMcpAlert = true }
+    a.show = function() buildAlert(a) end
+    alerts[#alerts + 1] = a
+    if #alerts == 1 then a.show() end
+    local labels = {}
+    for i, b in ipairs(buttons) do labels[i] = tostring(b) end
+    print(string.format("[solar2d-mcp] native.showAlert \"%s\": \"%s\" [%s] (shown in-app: tap a button or use answer_alert)",
+      a.title, a.message, table.concat(labels, " | ")))
+    return a
+  end
+  native.cancelAlert = function(ref)
+    if type(ref) == "table" and ref.isSolar2dMcpAlert then
+      closeAlert(ref, { action = "cancelled" })
+      return
+    end
+    return origCancel(ref)
+  end
+  Runtime:addEventListener("enterFrame", function()
+    local a = alerts[1]
+    if a and a.group and a.group.toFront then a.group:toFront() end
+  end)
+end
+
+H.alert = function(msg)
+  local a = alerts[1]
+  if not a then error("no alert is showing", 0) end
+  if msg.button == nil then return { title = a.title, message = a.message, buttons = a.buttons } end
+  local index = tonumber(msg.button)
+  if not index then
+    for i, b in ipairs(a.buttons) do
+      if tostring(b):lower() == tostring(msg.button):lower() then index = i end
+    end
+  end
+  if not index or not a.buttons[index] then
+    error("the alert has no button " .. tostring(msg.button) .. " (buttons: " .. table.concat(a.buttons, ", ") .. ")", 0)
+  end
+  answerAlert(a, index)
+  return { pressed = a.buttons[index], index = index, title = a.title }
+end
+
+----------------------------------------------------------------------------
+-- wait until a Lua expression is true
+----------------------------------------------------------------------------
+H.wait = function(msg, reply)
+  local f, err = loadstring("return " .. tostring(msg.lua), "=wait_for")
+  if not f then error(err, 0) end
+  local t0 = system.getTimer()
+  local timeout = tonumber(msg.timeout_ms) or 5000
+  local function check()
+    local ok, v = pcall(f)
+    local el = math.floor(system.getTimer() - t0)
+    if ok and v then
+      Runtime:removeEventListener("enterFrame", check)
+      reply(true, { met = true, after_ms = el, value = dump(v, 2, {}) })
+    elseif el >= timeout then
+      Runtime:removeEventListener("enterFrame", check)
+      reply(true, { met = false, after_ms = el, last_error = (not ok) and tostring(v) or nil })
+    end
+  end
+  Runtime:addEventListener("enterFrame", check)
   return ASYNC
 end
 
@@ -418,10 +692,16 @@ timer.performWithDelay(2000, tryConnect, 0)
 tryConnect()
 
 if SUPPRESS_ERROR_DIALOGS then
+  -- Solar2D prints the error and stack trace itself; returning true only stops the
+  -- blocking error dialog. When stdout isn't live, pass errors on (once per 2 s each).
+  local lastErr, lastT = nil, -1e9
   Runtime:addEventListener("unhandledError", function(e)
-    rawPrint("[solar2d-mcp] Runtime error: " .. tostring(e.errorMessage) .. "\n" .. tostring(e.stackTrace))
-    if client then send({ type = "error", message = tostring(e.errorMessage), stack = tostring(e.stackTrace) }) end
-    return true -- handled: no blocking error dialog
+    local m = tostring(e.errorMessage)
+    if forwardPrint and client and (m ~= lastErr or system.getTimer() - lastT > 2000) then
+      send({ type = "error", message = m, stack = tostring(e.stackTrace) })
+      lastErr, lastT = m, system.getTimer()
+    end
+    return true
   end)
 end
 

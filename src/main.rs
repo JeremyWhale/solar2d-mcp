@@ -27,7 +27,10 @@ display_tree, eval_lua -> edit code -> relaunch. \
 run_project adds one line at the very start of main.lua and writes solar2d_mcp_bridge.lua \
 next to it (both only act in the simulator; remove_bridge takes them out). \
 Tap/drag coordinates default to pixels in the last screenshot; display_tree gives \
-object bounds in content units (use unit \"content\" for those).";
+object bounds in content units (use unit \"content\" for those). \
+type_text types into native text fields; native.showAlert appears as an in-app overlay \
+(tap its buttons or use answer_alert). After an action that animates or changes scene, \
+use wait_for before the next screenshot. eval_lua can read or change any variable.";
 
 // ---------------------------------------------------------------- parameters
 
@@ -84,6 +87,8 @@ enum Unit {
 struct TapParams {
     x: f64,
     y: f64,
+    #[schemars(description = "How long the finger stays down, in ms. Default 100; use e.g. 800 for a long press")]
+    hold_ms: Option<u64>,
     #[schemars(description = "screenshot (default) | content | percent")]
     unit: Option<Unit>,
 }
@@ -127,6 +132,41 @@ struct EvalParams {
     code: String,
     #[schemars(description = "How deep to print returned tables. Default 3")]
     depth: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct TypeParams {
+    #[schemars(description = "The text to type")]
+    text: String,
+    #[schemars(description = "Name/id of the text field (see display_tree). Optional: defaults to the focused field, or the only one on screen")]
+    target: Option<String>,
+    #[schemars(description = "Or pick the field at a point")]
+    x: Option<f64>,
+    y: Option<f64>,
+    #[schemars(description = "Unit for x/y: screenshot (default) | content | percent")]
+    unit: Option<Unit>,
+    #[schemars(description = "Replace what's in the field (default true) or append")]
+    replace: Option<bool>,
+    #[schemars(description = "Press return afterwards: a \"submitted\" userInput event (default true)")]
+    submit: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct AlertParams {
+    #[schemars(description = "Button label or 1-based index. Leave out to just read the alert")]
+    button: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct WaitParams {
+    #[schemars(description = "Lua expression evaluated every frame until it is truthy, e.g. \"composer.getSceneName('current') == 'game'\"")]
+    lua: Option<String>,
+    #[schemars(description = "Wait for a log line containing this text (case-insensitive)")]
+    log_contains: Option<String>,
+    #[schemars(description = "For log_contains: also match lines from this read_logs cursor on (default: only new lines)")]
+    since: Option<u64>,
+    #[schemars(description = "Give up after this long. Default 5000. With neither lua nor log_contains, just waits this long")]
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -364,7 +404,9 @@ impl Solar2dMcp {
             Ok(v) => v,
             Err(e) => return err_text(e),
         };
-        match self.state.request(json!({"cmd": "tap", "x": x, "y": y, "unit": unit}), Duration::from_secs(10)).await {
+        let hold = p.hold_ms.unwrap_or(100).min(60_000);
+        let cmd = json!({"cmd": "tap", "x": x, "y": y, "unit": unit, "hold_ms": hold});
+        match self.state.request(cmd, Duration::from_millis(hold + 10_000)).await {
             Ok(r) => ok_text(pretty(&r)),
             Err(e) => err_text(e),
         }
@@ -421,6 +463,84 @@ impl Solar2dMcp {
                 ok_text(if vals.is_empty() { "(no value returned)".to_string() } else { vals.join("\n") })
             }
             Err(e) => err_text(format!("Lua error: {e}")),
+        }
+    }
+
+    #[tool(description = "Type into a native text field/text box: sends the userInput events a keyboard would (began, editing per character, submitted) and sets its text. With no text field in the app, sends key presses instead.")]
+    async fn type_text(&self, Parameters(p): Parameters<TypeParams>) -> Result<CallToolResult, McpError> {
+        let mut cmd = json!({"cmd": "type", "text": p.text, "replace": p.replace.unwrap_or(true), "submit": p.submit.unwrap_or(true)});
+        if let Some(t) = p.target {
+            cmd["target"] = json!(t);
+        } else if let (Some(x), Some(y)) = (p.x, p.y) {
+            match self.to_bridge_coords(x, y, p.unit) {
+                Ok((x, y, unit)) => {
+                    cmd["x"] = json!(x);
+                    cmd["y"] = json!(y);
+                    cmd["unit"] = json!(unit);
+                }
+                Err(e) => return err_text(e),
+            }
+        }
+        match self.state.request(cmd, Duration::from_secs(15)).await {
+            Ok(r) => ok_text(pretty(&r)),
+            Err(e) => err_text(e),
+        }
+    }
+
+    #[tool(description = "Read or answer the alert the app is showing (native.showAlert is shown as an in-app overlay while the bridge is in; its buttons can also be tapped).")]
+    async fn answer_alert(&self, Parameters(p): Parameters<AlertParams>) -> Result<CallToolResult, McpError> {
+        let mut cmd = json!({"cmd": "alert"});
+        if let Some(b) = p.button {
+            cmd["button"] = json!(b);
+        }
+        match self.state.request(cmd, Duration::from_secs(10)).await {
+            Ok(r) => ok_text(pretty(&r)),
+            Err(e) => err_text(e),
+        }
+    }
+
+    #[tool(description = "Wait until a Lua condition is true in the app and/or a log line appears (e.g. after a tap that starts a scene transition). Returns whether it happened and how long it took.")]
+    async fn wait_for(&self, Parameters(p): Parameters<WaitParams>) -> Result<CallToolResult, McpError> {
+        let timeout = p.timeout_ms.unwrap_or(5000).min(120_000);
+        let start = std::time::Instant::now();
+        let deadline = Duration::from_millis(timeout);
+        let log_from = p.since.unwrap_or_else(|| self.state.logs.lock().unwrap().next_cursor());
+        let needle = p.log_contains.as_ref().map(|s| s.to_lowercase());
+
+        let log_wait = async {
+            let Some(n) = needle.as_ref() else { return std::future::pending::<String>().await };
+            loop {
+                let found = self.state.logs.lock().unwrap().from(log_from).into_iter().find(|(_, l)| l.to_lowercase().contains(n));
+                if let Some((_, l)) = found {
+                    return format!("log line appeared after {} ms: {l}", start.elapsed().as_millis());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        let lua_wait = async {
+            let Some(code) = p.lua.as_ref() else { return std::future::pending::<Result<String, String>>().await };
+            let cmd = json!({"cmd": "wait", "lua": code, "timeout_ms": timeout});
+            match self.state.request(cmd, deadline + Duration::from_secs(5)).await {
+                Ok(r) if r.get("met").and_then(Value::as_bool) == Some(true) => Ok(format!(
+                    "condition true after {} ms (value {})",
+                    r["after_ms"], r.get("value").and_then(Value::as_str).unwrap_or("?")
+                )),
+                Ok(r) => Err(match r.get("last_error").and_then(Value::as_str) {
+                    Some(e) => format!("condition still false after {timeout} ms (last evaluation error: {e})"),
+                    None => format!("condition still false after {timeout} ms"),
+                }),
+                Err(e) => Err(e),
+            }
+        };
+        if p.lua.is_none() && needle.is_none() {
+            tokio::time::sleep(deadline).await;
+            return ok_text(format!("waited {timeout} ms"));
+        }
+        tokio::select! {
+            m = log_wait => ok_text(m),
+            r = lua_wait => match r { Ok(m) => ok_text(m), Err(e) => err_text(e) },
+            _ = tokio::time::sleep(deadline + Duration::from_millis(500)), if p.lua.is_none() =>
+                err_text(format!("no matching log line within {timeout} ms")),
         }
     }
 
@@ -489,6 +609,16 @@ async fn main() -> anyhow::Result<()> {
 
     let state = State::new(simulator);
     bridge::start(state.clone()).await?;
+    {
+        let st = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                tick.tick().await;
+                st.flush_repeats();
+            }
+        });
+    }
     let server = Solar2dMcp::new(state.clone());
     let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;

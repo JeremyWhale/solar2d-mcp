@@ -114,7 +114,7 @@ check("Runtime error in errorButton tap listener" in text(r), "listener error is
 call("eval_lua", code="timer.performWithDelay(1, function() local x = nil; return x.y end)")
 time.sleep(1)
 r = call("read_logs", max_lines=6)
-check("[solar2d-mcp] Runtime error:" in text(r) and "attempt to index" in text(r), "unhandled runtime error is logged (no dialog)")
+check("Runtime error" in text(r) and "attempt to index" in text(r), "unhandled runtime error is logged (no dialog)")
 r = call("eval_lua", code="1 + 1")
 check(text(r).strip() == "2", "app still alive after the error")
 r = call("eval_lua", code="error('boom')")

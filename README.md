@@ -17,11 +17,14 @@ during development).
 | `status` | Running? which project, bridge connected, screen/content size |
 | `read_logs` | `print()` output, warnings, runtime errors with stack traces (`since` cursor for only-new lines) |
 | `screenshot` | PNG of the screen right now (downscaled, default 1024 px longest side) |
-| `tap` | Touch began/ended + tap at a point, delivered to the topmost objects there |
-| `drag` | Touch began → moved every frame → ended |
+| `tap` | Touch began/ended + tap at a point, delivered to the topmost objects there (`hold_ms` for long presses) |
+| `drag` | Touch began → moved every frame → ended (swipes, sliders, scroll views, picker wheels) |
 | `key` | Key down/up to Runtime `key` listeners |
-| `display_tree` | Display hierarchy: names, kinds, text, bounds, visibility, listeners, composer scene |
-| `eval_lua` | Run Lua inside the app and get the result |
+| `type_text` | Type into a native text field/box: the `userInput` events a keyboard sends (began, editing per character, submitted) |
+| `answer_alert` | Read or answer a `native.showAlert` (shown as an in-app overlay; its buttons can also be tapped) |
+| `wait_for` | Wait for a Lua condition and/or a log line (after transitions, before screenshots) |
+| `display_tree` | Display hierarchy: names, kinds (incl. widget type, text fields), text, bounds, visibility, offscreen/clipped, listeners, composer scene |
+| `eval_lua` | Run Lua inside the app and get the result (read or change any variable) |
 | `remove_bridge` | Take the bridge back out of a project |
 
 Coordinates for `tap`/`drag` default to **pixels in the last screenshot**;
@@ -40,6 +43,18 @@ Coordinates for `tap`/`drag` default to **pixels in the last screenshot**;
   back to the server over `127.0.0.1` with LuaSocket and handles screenshot, input,
   tree and eval commands. Run `remove_bridge` before committing, or add
   `solar2d_mcp_bridge.lua` to `.gitignore`.
+- Input follows Solar2D's rules: topmost object first, propagating down until a
+  listener returns true, then Runtime; `setFocus` is honoured (a focused touch goes to
+  the focus object and up through its parent groups); scroll view / container clipping
+  is respected. Tested with every `widget` library widget (button, switch, slider,
+  segmented control, stepper, scroll view, table view, picker wheel, tab bar).
+- `native.showAlert` is replaced (simulator only, while the bridge is in) by an in-app
+  overlay, so the agent can see it in screenshots and press its buttons; the app's
+  listener gets the normal `completion` event. `native.cancelAlert` works too.
+- Native text fields are separate OS controls, so they don't appear in screenshots;
+  `display_tree` lists them (kind `textfield`/`textbox`) and `type_text` fills them.
+- A line repeated more than 5 times in 2 s (an error or print every frame) is collapsed
+  into one "N more copies hidden" note so it can't bury the rest of the log.
 - Lua runtime errors are logged instead of opening the simulator's blocking error
   dialog (`suppress_error_dialogs: false` to keep the dialog).
 - Before each launch it clears the simulator's "crashed last time it was run" flag
@@ -80,6 +95,7 @@ otherwise pass `--simulator <path>` or set `SOLAR2D_SIMULATOR`.
 ```
 tools/build-windows.sh        # -> target/x86_64-pc-windows-gnu/release/solar2d-mcp.exe
 tests/run_smoke_wine.sh       # end-to-end test: the .exe + Solar2D 3729 under Wine, hidden Xvfb display
+tests/with_wine_display.sh python3 -I "$PWD/tests/widget_smoke.py"   # widgets, typing, alerts
 ```
 
 Needs Rust with the `x86_64-pc-windows-gnu` target, `cargo-zigbuild` and Zig.

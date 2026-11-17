@@ -100,7 +100,7 @@ async fn handle_conn(state: Shared, stream: TcpStream) {
                 if state.logs_via_bridge.load(Ordering::SeqCst) {
                     if let Some(l) = v.get("line").and_then(Value::as_str) {
                         for part in l.lines() {
-                            state.log(part.to_string());
+                            state.log_app_line(part);
                         }
                     }
                 }
@@ -110,9 +110,9 @@ async fn handle_conn(state: Shared, stream: TcpStream) {
                 if state.logs_via_bridge.load(Ordering::SeqCst) {
                     let msg = v.get("message").and_then(Value::as_str).unwrap_or("?");
                     let stack = v.get("stack").and_then(Value::as_str).unwrap_or("");
-                    state.log(format!("[solar2d-mcp] Runtime error: {msg}"));
+                    state.log_app_line(&format!("Runtime error: {msg}"));
                     for l in stack.lines() {
-                        state.log(l.to_string());
+                        state.log_app_line(l);
                     }
                 }
             }

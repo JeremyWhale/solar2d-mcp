@@ -83,7 +83,18 @@ pub struct State {
     /// Size of the last screenshot we returned, for unit = "screenshot".
     pub last_shot: Mutex<Option<(u32, u32)>>,
     pub cli_simulator: Option<PathBuf>,
+    pub repeats: Mutex<RepeatFilter>,
 }
+
+/// Hides a line once it has appeared more than REPEAT_LIMIT times within REPEAT_WINDOW
+/// (an error or print firing every frame would otherwise bury everything else).
+#[derive(Default)]
+pub struct RepeatFilter {
+    seen: HashMap<String, (u32, Instant)>,
+    hidden: u64,
+}
+const REPEAT_LIMIT: u32 = 5;
+const REPEAT_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub type Shared = Arc<State>;
 
@@ -104,6 +115,7 @@ impl State {
             logs_via_bridge: AtomicBool::new(false),
             last_shot: Mutex::new(None),
             cli_simulator,
+            repeats: Mutex::new(RepeatFilter::default()),
         })
     }
 
@@ -137,7 +149,39 @@ impl State {
         if self.logs_via_bridge.load(Ordering::SeqCst) {
             return; // the bridge forwards print() instead; avoid late duplicates
         }
-        self.log(trimmed.to_string());
+        self.log_app_line(trimmed);
+    }
+
+    /// A line of the app's own output (stdout, or forwarded by the bridge).
+    pub fn log_app_line(&self, line: &str) {
+        {
+            let mut f = self.repeats.lock().unwrap();
+            let now = Instant::now();
+            if f.seen.len() > 4000 {
+                f.seen.retain(|_, (_, t)| now.duration_since(*t) < REPEAT_WINDOW);
+            }
+            let e = f.seen.entry(line.to_string()).or_insert((0, now));
+            if now.duration_since(e.1) > REPEAT_WINDOW {
+                *e = (0, now);
+            }
+            e.0 += 1;
+            if e.0 > REPEAT_LIMIT {
+                f.hidden += 1;
+                return;
+            }
+        }
+        self.log(line.to_string());
+    }
+
+    /// Called every couple of seconds: note how many repeated lines were hidden.
+    pub fn flush_repeats(&self) {
+        let hidden = std::mem::take(&mut self.repeats.lock().unwrap().hidden);
+        if hidden > 0 {
+            self.log(format!(
+                "[solar2d-mcp] {hidden} more copies of the lines above hidden (the same output many times a second: \
+                 probably an error or print() in an enterFrame/timer)"
+            ));
+        }
     }
 
     /// Send a command to the bridge and wait for its reply.
