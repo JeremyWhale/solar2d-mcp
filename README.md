@@ -94,12 +94,33 @@ Coordinates for `tap`/`drag` default to **pixels in the last screenshot**;
 The simulator is found automatically in `Program Files (x86)\Corona Labs\Corona`;
 otherwise pass `--simulator <path>` or set `SOLAR2D_SIMULATOR`.
 
+## Updating
+
+```
+C:\Tools\solar2d-mcp\solar2d-mcp.exe --update
+```
+
+Downloads the latest release and swaps it in (fine while Codex is open; the new version
+starts the next time Codex launches the server). `--check-update` only reports.
+
+About once a day the server checks for a new release and, if there is one, `status` and
+`run_project` mention it so the agent can tell you. Nothing is installed unless you run
+`--update`. The check only downloads a small file from this repo's GitHub releases, using
+the Windows certificate store and proxy setting (or `HTTPS_PROXY`). Set
+`SOLAR2D_MCP_NO_UPDATE_CHECK=1` to turn it off.
+
+Each release has a manifest (version, size, SHA-256 of the exe) signed with an Ed25519 key
+held only by the maintainer. `--update` refuses a bad signature, a checksum mismatch, an
+older version, or an exe that doesn't start and report the promised version.
+
 ## Building (on Linux)
 
 ```
 tools/build-windows.sh        # -> target/x86_64-pc-windows-gnu/release/solar2d-mcp.exe
 tests/run_smoke_wine.sh       # end-to-end test: the .exe + Solar2D 3729 under Wine, hidden Xvfb display
 tests/with_wine_display.sh python3 -I "$PWD/tests/widget_smoke.py"   # widgets, typing, alerts
+tests/update_test.sh          # --update against a local server: good and hostile updates
+tools/release.sh --publish    # build, run all tests, sign, tag and create the GitHub release
 ```
 
 Needs Rust with the `x86_64-pc-windows-gnu` target, `cargo-zigbuild` and Zig.

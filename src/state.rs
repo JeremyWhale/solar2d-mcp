@@ -84,6 +84,8 @@ pub struct State {
     pub last_shot: Mutex<Option<(u32, u32)>>,
     pub cli_simulator: Option<PathBuf>,
     pub repeats: Mutex<RepeatFilter>,
+    /// A newer release, once the daily update check has found one.
+    pub update_available: Mutex<Option<String>>,
 }
 
 /// Hides a line once it has appeared more than REPEAT_LIMIT times within REPEAT_WINDOW
@@ -116,6 +118,7 @@ impl State {
             last_shot: Mutex::new(None),
             cli_simulator,
             repeats: Mutex::new(RepeatFilter::default()),
+            update_available: Mutex::new(None),
         })
     }
 

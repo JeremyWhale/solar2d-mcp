@@ -2,3 +2,5 @@ target/
 tests/out/
 tests/testapp/solar2d_mcp_bridge.lua
 __pycache__/
+*.pem
+*.key

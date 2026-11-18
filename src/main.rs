@@ -4,6 +4,7 @@
 mod bridge;
 mod sim;
 mod state;
+mod update;
 
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -31,7 +32,8 @@ object bounds in content units (use unit \"content\" for those). \
 touch_down/touch_move/touch_up hold fingers down across calls (press and hold, multi-touch). \
 type_text types into native text fields; native.showAlert appears as an in-app overlay \
 (tap its buttons or use answer_alert). After an action that animates or changes scene, \
-use wait_for before the next screenshot. eval_lua can read or change any variable.";
+use wait_for before the next screenshot. eval_lua can read or change any variable. \
+If a result says an update is available, tell the user how to install it.";
 
 // ---------------------------------------------------------------- parameters
 
@@ -282,8 +284,9 @@ impl Solar2dMcp {
         let tail: Vec<String> = lines.iter().rev().take(80).rev().map(|(_, l)| l.clone()).collect();
         let next = self.state.logs.lock().unwrap().next_cursor();
         let status = self.status_json().await;
+        let update = update::notice(&self.state).map(|n| format!("\n\n{n}")).unwrap_or_default();
         ok_text(format!(
-            "{outcome}\n\nstatus:\n{}\n\nlogs so far (next_cursor {next}):\n{}",
+            "{outcome}\n\nstatus:\n{}\n\nlogs so far (next_cursor {next}):\n{}{update}",
             pretty(&status),
             tail.join("\n")
         ))
@@ -358,6 +361,10 @@ impl Solar2dMcp {
     #[tool(description = "Whether the simulator is running, which project, whether the bridge is connected, the screen/content size, and any fingers held down.")]
     async fn status(&self) -> Result<CallToolResult, McpError> {
         let mut st = self.status_json().await;
+        st["version"] = json!(update::VERSION);
+        if let Some(n) = update::notice(&self.state) {
+            st["update_available"] = json!(n);
+        }
         if self.state.bridge_connected() {
             if let Ok(f) = self.state.request(json!({"cmd": "fingers"}), Duration::from_secs(3)).await {
                 st["fingers_down"] = f.get("fingers").cloned().unwrap_or(Value::Null);
@@ -682,14 +689,31 @@ async fn main() -> anyhow::Result<()> {
         match a.as_str() {
             "--simulator" => simulator = args.next().map(PathBuf::from),
             "--version" | "-V" => {
-                eprintln!("solar2d-mcp {}", env!("CARGO_PKG_VERSION"));
+                eprintln!("solar2d-mcp {}", update::VERSION);
                 return Ok(());
+            }
+            "--update" | "--check-update" => {
+                let result = if a == "--update" { update::run_update() } else { update::check_now() };
+                match result {
+                    Ok(msg) => {
+                        eprintln!("{msg}");
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        eprintln!("Update failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
             }
             "--help" | "-h" => {
                 eprintln!(
                     "solar2d-mcp {}: MCP server (stdio) for the Solar2D Simulator\n\n\
-                     Options:\n  --simulator <path>   path to \"Corona Simulator.exe\" (or set SOLAR2D_SIMULATOR)\n",
-                    env!("CARGO_PKG_VERSION")
+                     Options:\n  --simulator <path>   path to \"Corona Simulator.exe\" (or set SOLAR2D_SIMULATOR)\n  \
+                     --update             download and install the latest release\n  \
+                     --check-update       say whether a newer release exists\n  \
+                     --version            print the version\n\n\
+                     Set SOLAR2D_MCP_NO_UPDATE_CHECK=1 to turn off the daily check for new versions.\n",
+                    update::VERSION
                 );
                 return Ok(());
             }
@@ -697,7 +721,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    update::remove_old_copies();
     let state = State::new(simulator);
+    update::start_background_check(state.clone());
     bridge::start(state.clone()).await?;
     {
         let st = state.clone();
