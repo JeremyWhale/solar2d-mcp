@@ -1,6 +1,8 @@
 [package]
 name = "solar2d-mcp"
 version = "0.1.0"
+license = "MIT"
+description = "MCP server for the Solar2D Simulator: run, watch and drive Solar2D projects from an AI agent"
 edition = "2024"
 
 [dependencies]

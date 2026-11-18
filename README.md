@@ -107,3 +107,7 @@ The dev scripts expect a tools folder (Zig, portable Wine, Xvfb, Solar2D install
 Wine) with an `env.sh` that sets `CARGO_HOME`, `PATH`, `WINEPREFIX` and `WINE`; point
 `SOLAR2D_MCP_TOOLS` at it.
 `tests/mcp_smoke.py` is a dev-only test client and is not part of the Windows build.
+
+## Licence
+
+MIT, see [LICENSE](LICENSE).
