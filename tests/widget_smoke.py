@@ -2,9 +2,9 @@
 """Widget-library + text input + alert test for solar2d-mcp (dev-only, Linux/Wine)."""
 import json, os, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mcp_client import Client, EXE, find, center
+from mcp_client import Client, EXE, find, center, wine_path
 
-PROJECT = r'Z:\media\jeremy\1TB SSD\solar2d-mcp\tests\widgetapp'
+PROJECT = wine_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "widgetapp"))
 c = Client([os.environ["WINE"], EXE], os.path.join(os.path.dirname(os.path.abspath(__file__)), "out", "widgets"), quiet=True)
 
 

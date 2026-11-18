@@ -103,6 +103,7 @@ tests/with_wine_display.sh python3 -I "$PWD/tests/widget_smoke.py"   # widgets, 
 ```
 
 Needs Rust with the `x86_64-pc-windows-gnu` target, `cargo-zigbuild` and Zig.
-The dev toolchain (Zig, portable Wine, Xvfb, the Solar2D install) lives in
-`/media/jeremy/1TB SSD/solar2d-mcp-tools`; `source` its `env.sh` first.
+The dev scripts expect a tools folder (Zig, portable Wine, Xvfb, Solar2D installed in
+Wine) with an `env.sh` that sets `CARGO_HOME`, `PATH`, `WINEPREFIX` and `WINE`; point
+`SOLAR2D_MCP_TOOLS` at it.
 `tests/mcp_smoke.py` is a dev-only test client and is not part of the Windows build.

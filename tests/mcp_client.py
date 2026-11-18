@@ -1,8 +1,13 @@
 """Tiny MCP stdio client for dev tests (Linux only; never shipped)."""
 import base64, json, os, subprocess, sys, time
 
-WINE_ENV = "/media/jeremy/1TB SSD/solar2d-mcp-tools/env.sh"
-EXE = "/media/jeremy/1TB SSD/solar2d-mcp/target/x86_64-pc-windows-gnu/release/solar2d-mcp.exe"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+EXE = os.path.join(REPO, "target", "x86_64-pc-windows-gnu", "release", "solar2d-mcp.exe")
+
+
+def wine_path(path):
+    """Linux path -> the Z: path the Windows build sees under Wine."""
+    return "Z:" + os.path.abspath(path).replace("/", "\\")
 
 
 class Client:
